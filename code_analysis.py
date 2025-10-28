@@ -1,8 +1,10 @@
 from pathlib import Path
 from typing import Optional, List, Dict, Union, Set
 from dataclasses import dataclass
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.prompts.base import UserMessage, AssistantMessage
+import mcp.types as types
+from mcp.server import NotificationOptions, Server
+from mcp.server.models import InitializationOptions
+import mcp.server.stdio
 import os
 from pathspec import PathSpec
 from pathspec.patterns import GitWildMatchPattern
@@ -383,198 +385,194 @@ class FileReader:
                 "isError": True
             }
 
-class CodeAnalysisServer(FastMCP):
-    def __init__(self, name: str):
-        # super().__init__(name)
-        # First, call the parent class constructor with capabilities
-        super().__init__(
-            name,
-            capabilities={
-                "prompts": {}  # Enable prompts capability
-            }
-        )
-        self.repo_path: Optional[Path] = None
-        self.analyzer: Optional[RepoStructureAnalyzer] = None
-        self.file_reader: Optional[FileReader] = None
-
-        # Add prompts capability
-        # self.capabilities["prompts"] = {}
-
-    def initialize_repo(self, path: str) -> None:
-        """Initialize the repository path and analysis tools."""
-        if not path or path in (".", "./"):
-            raise ValueError("Repository path must be an absolute path")
-            
-        repo_path = Path(path).resolve()
-        if not repo_path.is_absolute():
-            raise ValueError(f"Repository path must be absolute, got: {repo_path}")
-        if not repo_path.exists():
-            raise ValueError(f"Repository path does not exist: {repo_path}")
-        if not repo_path.is_dir():
-            raise ValueError(f"Repository path is not a directory: {repo_path}")
-        
-        self.repo_path = repo_path
-        self.analyzer = RepoStructureAnalyzer(self.repo_path)
-        self.file_reader = FileReader(self.repo_path)
+# Global state
+repo_path: Optional[Path] = None
+analyzer: Optional[RepoStructureAnalyzer] = None
+file_reader: Optional[FileReader] = None
 
 # Initialize server
-mcp = CodeAnalysisServer("code-analysis")
+server = Server("code-analysis")
 
-@mcp.tool()
-async def initialize_repository(path: str) -> str:
-    """Initialize the repository path for future code analysis operations.
+def initialize_repo(path: str) -> None:
+    """Initialize the repository path and analysis tools."""
+    global repo_path, analyzer, file_reader
     
-    Args:
-        path: Path to the repository root directory that contains the code to analyze
-    """
-    try:
-        mcp.initialize_repo(path)
-        gitignore_path = Path(path) / '.gitignore'
-        gitignore_status = "Found .gitignore file" if gitignore_path.exists() else "No .gitignore file present"
-        return f"Successfully initialized code repository at: {mcp.repo_path}\n{gitignore_status}"
-    except ValueError as e:
-        return f"Error initializing code repository: {str(e)}"
-
-@mcp.tool()
-async def get_repo_info() -> str:
-    """Get information about the currently initialized code repository."""
-    if not mcp.repo_path:
-        return "No code repository has been initialized yet. Please use initialize_repository first."
-    
-    gitignore_path = mcp.repo_path / '.gitignore'
-    gitignore_status = "Found .gitignore file" if gitignore_path.exists() else "No .gitignore file present"
-    
-    return f"""Code Repository Information:
-Path: {mcp.repo_path}
-Exists: {mcp.repo_path.exists()}
-Is Directory: {mcp.repo_path.is_dir()}
-{gitignore_status}"""
-
-@mcp.tool()
-async def get_repo_structure(sub_path: Optional[str] = None, depth: Optional[int] = None) -> str:
-    """Get the structure of files and directories in the repository.
-    
-    Args:
-        sub_path: Optional subdirectory path relative to repository root
-        depth: Optional maximum depth to traverse (default is 3)
-    """
-    if not mcp.repo_path or not mcp.analyzer:
-        return "No code repository has been initialized yet. Please use initialize_repository first."
-
-    try:
-        target_path = mcp.repo_path
-        if sub_path:
-            target_path = mcp.repo_path / sub_path
-            if not mcp.analyzer._is_safe_path(target_path):
-                return "Error: Invalid path - directory traversal not allowed"
-
-        structure = mcp.analyzer.get_structure(
-            target_path,
-            sub_path or '',
-            max_depth=depth
-        )
-        return mcp.analyzer.format_structure(structure)
-    except Exception as e:
-        return f"Error analyzing repository structure: {str(e)}"
-
-@mcp.tool()
-async def read_file(file_path: str) -> str:
-    """Read and display the contents of a file from the repository.
-    
-    Args:
-        file_path: Path to the file relative to repository root
-    """
-    if not mcp.repo_path or not mcp.file_reader or not mcp.analyzer:
-        return "No code repository has been initialized yet. Please use initialize_repository first."
-
-    try:
-        # Check if file should be ignored based on gitignore patterns
-        if mcp.analyzer.should_ignore(file_path):
-            return f"File {file_path} is ignored based on .gitignore patterns"
-
-        result = mcp.file_reader.read_file(file_path)
+    if not path or path in (".", "./"):
+        raise ValueError("Repository path must be an absolute path")
         
-        if result.get("isError", False):
-            return result["content"][0]["text"]
-        
-        return result["content"][0]["text"]
-        
-    except Exception as e:
-        return f"Error reading file: {str(e)}"
-
-@mcp.prompt()
-def analyze_code_repository(codebase_path: str) -> list[UserMessage | AssistantMessage]:
-    """Analyze a code repository at the specified path.
+    repo_path_obj = Path(path).resolve()
+    if not repo_path_obj.is_absolute():
+        raise ValueError(f"Repository path must be absolute, got: {repo_path_obj}")
+    if not repo_path_obj.exists():
+        raise ValueError(f"Repository path does not exist: {repo_path_obj}")
+    if not repo_path_obj.is_dir():
+        raise ValueError(f"Repository path is not a directory: {repo_path_obj}")
     
-    Args:
-        codebase_path: Absolute path to the code repository
-    """
+    repo_path = repo_path_obj
+    analyzer = RepoStructureAnalyzer(repo_path)
+    file_reader = FileReader(repo_path)
+
+@server.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    """List available tools."""
     return [
-        UserMessage(f"""You are an AI assistant specialized in codebase analysis, operating as part of an MCP server named code-analysis. Your task is to analyze codebases and answer user questions about them using a set of specialized tools. 
-
-The codebase we are going to analyze is located at {codebase_path}
-The user will ask specific questions about this codebase. To answer the user's questions, follow these steps:
-
-1. Initialize Repository:
-   - Use the `initialize_repository(path: str) -> str` tool with the full path to the repository root directory.
-   - This step is required before using any other tools.
-
-2. Verify Initialization:
-   - Use the `get_repo_info() -> str` tool to confirm successful initialization.
-   - This will show the path, existence verification, and .gitignore status.
-
-3. Get Repository Structure:
-   - Use the `get_repo_structure(sub_path?: str, depth?: int) -> str` tool to generate a tree view of the repository's file structure.
-   - Start with the default depth for an overview, then use sub_path to explore specific directories of interest.
-   - Increase depth only for detailed investigation of specific areas.
-
-4. Read Files:
-   - Use the `read_file(file_path: str) -> str` tool to read and display file contents with syntax recognition.
-   - This tool is limited to files under 1MB and 1000 lines.
-   - Start with README files and other documentation to gain initial context.
-
-5. Systematic Investigation:
-   - Generate an initial hypothesis about the system based on the repository structure and documentation.
-   - Use the tools strategically to explore the codebase, focusing on areas relevant to the user's question.
-   - Continuously update your understanding as you gather more information.
-   - Use the `memory` and/or `sequential-thinking` MCP servers if available
-
-6. Evidence-Based Analysis:
-   - Support all claims with concrete evidence from the codebase.
-   - Clearly distinguish between directly verified code, inferred patterns, and areas requiring further investigation.
-
-7. Comprehensive Analysis Presentation:
-   Present your findings in the following format:
-   a. Initial System Hypothesis
-   b. Investigation Methodology
-   c. Discovered System Characteristics
-   d. Supporting Evidence
-   e. Remaining Uncertainties
-   f. Final Answer to User's Question
-
-Throughout your analysis, document your thought process inside <investigation_log> tags. For each step:
-  - State the current focus or question you're addressing.
-  - List the potential tools you could use and explain your choice.
-  - Document the results of each tool use, quoting relevant code snippets or file contents.
-  - Explain your reasoning when forming hypotheses or drawing conclusions.
-  - Summarize your findings periodically throughout the investigation.
-
-Be sure to use the available tools appropriately and document any limitations or errors encountered. It's okay for this section to be quite long.
-
-Remember:
-- You are operating in the context of an MCP server named code-analysis.
-- Always use the tools provided and do not assume access to any other capabilities.
-- If you encounter any errors or limitations with the tools, clearly state them in your analysis.
-- Maintain a systematic and evidence-based approach throughout your investigation.
-
-Now, you are ready to begin your analysis of the codebase. Please do the necessary steps to initialize. 
-Let me know when you are ready and I will provide the question I want to investigate.
-                    """),
-#         AssistantMessage("""I'll help you analyze this codebase. First, let me initialize the repository to get started. I will then present
-#         my initial insights and ask you the question that you want to investigate.
-# """)
+        types.Tool(
+            name="initialize_repository",
+            description="Initialize the repository path for future code analysis operations",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the repository root directory that contains the code to analyze"
+                    }
+                },
+                "required": ["path"]
+            }
+        ),
+        types.Tool(
+            name="get_repo_info",
+            description="Get information about the currently initialized code repository",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        types.Tool(
+            name="get_repo_structure",
+            description="Get the structure of files and directories in the repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sub_path": {
+                        "type": "string",
+                        "description": "Optional subdirectory path relative to repository root"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Optional maximum depth to traverse (default is 3)"
+                    }
+                }
+            }
+        ),
+        types.Tool(
+            name="read_file",
+            description="Read and display the contents of a file from the repository",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file relative to repository root"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        )
     ]
 
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    """Handle tool calls."""
+    global repo_path, analyzer, file_reader
+    
+    if name == "initialize_repository":
+        try:
+            path = arguments["path"]
+            initialize_repo(path)
+            gitignore_path = Path(path) / '.gitignore'
+            gitignore_status = "Found .gitignore file" if gitignore_path.exists() else "No .gitignore file present"
+            result = f"Successfully initialized code repository at: {repo_path}\n{gitignore_status}"
+        except ValueError as e:
+            result = f"Error initializing code repository: {str(e)}"
+        except Exception as e:
+            result = f"Unexpected error: {str(e)}"
+        
+        return [types.TextContent(type="text", text=result)]
+    
+    elif name == "get_repo_info":
+        if not repo_path:
+            result = "No code repository has been initialized yet. Please use initialize_repository first."
+        else:
+            gitignore_path = repo_path / '.gitignore'
+            gitignore_status = "Found .gitignore file" if gitignore_path.exists() else "No .gitignore file present"
+            
+            result = f"""Code Repository Information:
+Path: {repo_path}
+Exists: {repo_path.exists()}
+Is Directory: {repo_path.is_dir()}
+{gitignore_status}"""
+        
+        return [types.TextContent(type="text", text=result)]
+    
+    elif name == "get_repo_structure":
+        if not repo_path or not analyzer:
+            result = "No code repository has been initialized yet. Please use initialize_repository first."
+        else:
+            try:
+                sub_path = arguments.get("sub_path")
+                depth = arguments.get("depth")
+                
+                target_path = repo_path
+                if sub_path:
+                    target_path = repo_path / sub_path
+                    if not analyzer._is_safe_path(target_path):
+                        result = "Error: Invalid path - directory traversal not allowed"
+                        return [types.TextContent(type="text", text=result)]
+
+                structure = analyzer.get_structure(
+                    target_path,
+                    sub_path or '',
+                    max_depth=depth
+                )
+                result = analyzer.format_structure(structure)
+            except Exception as e:
+                result = f"Error analyzing repository structure: {str(e)}"
+        
+        return [types.TextContent(type="text", text=result)]
+    
+    elif name == "read_file":
+        if not repo_path or not file_reader or not analyzer:
+            result = "No code repository has been initialized yet. Please use initialize_repository first."
+        else:
+            try:
+                file_path = arguments["file_path"]
+                
+                # Check if file should be ignored based on gitignore patterns
+                if analyzer.should_ignore(file_path):
+                    result = f"File {file_path} is ignored based on .gitignore patterns"
+                else:
+                    file_result = file_reader.read_file(file_path)
+                    
+                    if file_result.get("isError", False):
+                        result = file_result["content"][0]["text"]
+                    else:
+                        result = file_result["content"][0]["text"]
+                        
+            except Exception as e:
+                result = f"Error reading file: {str(e)}"
+        
+        return [types.TextContent(type="text", text=result)]
+    
+    else:
+        raise ValueError(f"Unknown tool: {name}")
+
+async def main():
+    """Main entry point for the MCP server."""
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="code-analysis",
+                server_version="0.1.0",
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
+
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    import asyncio
+    asyncio.run(main())
