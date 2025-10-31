@@ -1,6 +1,6 @@
 [project]
 name = "iflow-mcp_code-analysis-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -11,4 +11,4 @@ dependencies = [
 ]
 
 [project.scripts]
-code-analysis-mcp = "code_analysis:main"
+code-analysis-mcp = "code_analysis:cli_main"
